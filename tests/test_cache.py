@@ -62,21 +62,25 @@ def test_similar_query_is_a_semantic_hit(cache: Cache) -> None:
 
 def test_unrelated_query_is_a_miss(cache: Cache) -> None:
   cache.set(_entry('what is 2+2', '4'))
-  assert cache.get(SCOPE, 'how do i deploy postgres', None) is None
+  response = cache.get(SCOPE, 'how do i deploy postgres', None)
+  assert response.entry is None
 
 
 def test_threshold_of_one_rejects_near_matches(store: Postgres) -> None:
   cache = Cache(store=store, embedder=StubEmbedder(), similarity_threshold=1.0)
   cache.set(_entry('what is 2+2', '4'))
-  assert cache.get(SCOPE, 'whats 2 + 2', None) is None
+  response = cache.get(SCOPE, 'whats 2 + 2', None)
+  assert response.entry is None
 
 
 def test_low_threshold_accepts_anything(store: Postgres) -> None:
   cache = Cache(store=store, embedder=StubEmbedder(), similarity_threshold=0.0)
   cache.set(_entry('what is 2+2', '4'))
-  entry = cache.get(SCOPE, 'how do i deploy postgres', None)
-  assert entry is not None
+  response = cache.get(SCOPE, 'how do i deploy postgres', None)
+  assert response is not None
+  assert response.entry is not None
 
 
 def test_empty_cache_is_a_miss(cache: Cache) -> None:
-  assert cache.get(SCOPE, 'what is 2+2', 'what is 2+2') is None
+  response = cache.get(SCOPE, 'what is 2+2', 'what is 2+2')
+  assert response.entry is None
