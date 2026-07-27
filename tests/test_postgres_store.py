@@ -2,6 +2,7 @@ import math
 import random
 from datetime import datetime, timedelta, timezone
 
+import psycopg
 import pytest
 
 from llm_cache.models import CacheEntry
@@ -9,24 +10,30 @@ from llm_cache.store.postgres import Postgres
 
 pytestmark = pytest.mark.integration
 
+type Vectors = tuple[list[float], list[float], list[float]]
+
 SCOPE = 'gpt-4o|thread:abc'
-VECTOR = [0.01] * 1536
+VECTOR: list[float] = [0.01] * 1536
 
 
-def _insert(store: Postgres, fingerprint: str, expires: str | None = None) -> None:
-  """Seed a row directly, until put() exists."""
-  expires_at = f"now() + interval '{expires}'" if expires else 'NULL'
-  with store._pool.connection() as conn:
-    conn.execute(
-      'INSERT INTO llm_cache'
-      ' (scope, fingerprint, query, response, embedding, expires_at, metadata)'
-      f' VALUES (%s, %s, %s, %s, %s, {expires_at}, %s)',
-      (SCOPE, fingerprint, 'what is 2+2', '4', VECTOR, '{"tokens": 7}'),
-    )
+def _insert(
+  db: psycopg.Connection, fingerprint: str, expires: str | None = None
+) -> None:
+  """Seed a row with raw SQL, bypassing put().
+
+  `expires` is a Postgres interval like '-1 hour', or None for no expiry —
+  `now() + NULL::interval` is NULL, so the two cases need no branching.
+  """
+  db.execute(
+    'INSERT INTO llm_cache'
+    ' (scope, fingerprint, query, response, embedding, expires_at, metadata)'
+    ' VALUES (%s, %s, %s, %s, %s, now() + %s::interval, %s)',
+    (SCOPE, fingerprint, 'what is 2+2', '4', VECTOR, expires, '{"tokens": 7}'),
+  )
 
 
-def test_get_exact_returns_entry(store: Postgres) -> None:
-  _insert(store, 'ff00')
+def test_get_exact_returns_entry(store: Postgres, db: psycopg.Connection) -> None:
+  _insert(db, 'ff00')
   entry = store.get_exact(SCOPE, 'ff00')
   assert entry is not None
   assert entry.response == '4'
@@ -35,23 +42,25 @@ def test_get_exact_returns_entry(store: Postgres) -> None:
   assert entry.hits == 0
 
 
-def test_get_exact_misses_on_unknown_fingerprint(store: Postgres) -> None:
-  _insert(store, 'ff00')
+def test_get_exact_misses_on_unknown_fingerprint(
+  store: Postgres, db: psycopg.Connection
+) -> None:
+  _insert(db, 'ff00')
   assert store.get_exact(SCOPE, 'nope') is None
 
 
-def test_get_exact_is_scoped(store: Postgres) -> None:
-  _insert(store, 'ff00')
+def test_get_exact_is_scoped(store: Postgres, db: psycopg.Connection) -> None:
+  _insert(db, 'ff00')
   assert store.get_exact('gpt-4o|thread:other', 'ff00') is None
 
 
-def test_get_exact_skips_expired(store: Postgres) -> None:
-  _insert(store, 'stale', expires='-1 hour')
+def test_get_exact_skips_expired(store: Postgres, db: psycopg.Connection) -> None:
+  _insert(db, 'stale', expires='-1 hour')
   assert store.get_exact(SCOPE, 'stale') is None
 
 
-def test_get_exact_returns_unexpired(store: Postgres) -> None:
-  _insert(store, 'fresh', expires='1 hour')
+def test_get_exact_returns_unexpired(store: Postgres, db: psycopg.Connection) -> None:
+  _insert(db, 'fresh', expires='1 hour')
   assert store.get_exact(SCOPE, 'fresh') is not None
 
 
@@ -82,22 +91,22 @@ def test_put_twice_upserts_instead_of_raising(store: Postgres) -> None:
   assert entry.response == 'four'
 
 
-def test_put_preserves_hit_counters_on_upsert(store: Postgres) -> None:
+def test_put_preserves_hit_counters_on_upsert(
+  store: Postgres, db: psycopg.Connection
+) -> None:
   store.put(_entry('aa11'), VECTOR)
-  with store._pool.connection() as conn:
-    conn.execute('UPDATE llm_cache SET hits = 9 WHERE fingerprint = %s', ('aa11',))
+  db.execute('UPDATE llm_cache SET hits = 9 WHERE fingerprint = %s', ('aa11',))
   store.put(_entry('aa11', response='four'), VECTOR)
   entry = store.get_exact(SCOPE, 'aa11')
   assert entry is not None
   assert entry.hits == 9
 
 
-def test_put_stores_the_vector(store: Postgres) -> None:
+def test_put_stores_the_vector(store: Postgres, db: psycopg.Connection) -> None:
   store.put(_entry('aa11'), VECTOR)
-  with store._pool.connection() as conn:
-    stored = conn.execute(
-      'SELECT embedding FROM llm_cache WHERE fingerprint = %s', ('aa11',)
-    ).fetchone()
+  stored = db.execute(
+    'SELECT embedding FROM llm_cache WHERE fingerprint = %s', ('aa11',)
+  ).fetchone()
   assert stored is not None
   assert stored[0].to_list() == pytest.approx(VECTOR)
 
@@ -113,7 +122,9 @@ def test_touch_increments_hits(store: Postgres) -> None:
 
 def test_touch_sets_last_used_at(store: Postgres) -> None:
   store.put(_entry('aa11'), VECTOR)
-  assert store.get_exact(SCOPE, 'aa11').last_used_at is None
+  entry = store.get_exact(SCOPE, 'aa11')
+  assert entry is not None
+  assert entry.last_used_at is None
   store.touch(SCOPE, 'aa11')
   entry = store.get_exact(SCOPE, 'aa11')
   assert entry is not None
@@ -138,7 +149,7 @@ def _unit(values: list[float]) -> list[float]:
 
 
 @pytest.fixture
-def vectors() -> tuple[list[float], list[float], list[float]]:
+def vectors() -> Vectors:
   """A base vector, one almost identical to it, and one unrelated."""
   rng = random.Random(0)
   base = _unit([rng.random() for _ in range(1536)])
@@ -147,7 +158,7 @@ def vectors() -> tuple[list[float], list[float], list[float]]:
   return base, near, far
 
 
-def test_search_orders_by_similarity(store: Postgres, vectors) -> None:
+def test_search_orders_by_similarity(store: Postgres, vectors: Vectors) -> None:
   base, near, far = vectors
   store.put(_entry('identical'), base)
   store.put(_entry('similar'), near)
@@ -158,7 +169,7 @@ def test_search_orders_by_similarity(store: Postgres, vectors) -> None:
   assert results[0][1] > results[1][1] > results[2][1]
 
 
-def test_search_respects_limit(store: Postgres, vectors) -> None:
+def test_search_respects_limit(store: Postgres, vectors: Vectors) -> None:
   base, near, far = vectors
   store.put(_entry('identical'), base)
   store.put(_entry('similar'), near)
@@ -166,7 +177,7 @@ def test_search_respects_limit(store: Postgres, vectors) -> None:
   assert len(store.search(SCOPE, base, 1)) == 1
 
 
-def test_search_is_scoped(store: Postgres, vectors) -> None:
+def test_search_is_scoped(store: Postgres, vectors: Vectors) -> None:
   base, _, _ = vectors
   other = _entry('elsewhere')
   other.scope = 'gpt-4o|thread:other'
@@ -174,7 +185,7 @@ def test_search_is_scoped(store: Postgres, vectors) -> None:
   assert store.search(SCOPE, base, 5) == []
 
 
-def test_search_skips_expired(store: Postgres, vectors) -> None:
+def test_search_skips_expired(store: Postgres, vectors: Vectors) -> None:
   base, near, _ = vectors
   stale = _entry('stale')
   stale.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
@@ -183,7 +194,7 @@ def test_search_skips_expired(store: Postgres, vectors) -> None:
   assert [e.fingerprint for e, _ in store.search(SCOPE, base, 5)] == ['live']
 
 
-def test_search_returns_full_entries(store: Postgres, vectors) -> None:
+def test_search_returns_full_entries(store: Postgres, vectors: Vectors) -> None:
   base, _, _ = vectors
   store.put(_entry('aa11'), base)
   entry, score = store.search(SCOPE, base, 1)[0]
@@ -192,6 +203,8 @@ def test_search_returns_full_entries(store: Postgres, vectors) -> None:
   assert isinstance(score, float)
 
 
-def test_search_on_empty_scope_returns_empty_list(store: Postgres, vectors) -> None:
+def test_search_on_empty_scope_returns_empty_list(
+  store: Postgres, vectors: Vectors
+) -> None:
   base, _, _ = vectors
   assert store.search(SCOPE, base, 5) == []
