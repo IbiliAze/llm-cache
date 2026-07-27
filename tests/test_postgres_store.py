@@ -208,3 +208,54 @@ def test_search_on_empty_scope_returns_empty_list(
 ) -> None:
   base, _, _ = vectors
   assert store.search(SCOPE, base, 5) == []
+
+
+def test_touch_many_applies_deltas_in_one_call(store: Postgres) -> None:
+  store.put(_entry('aa11'), VECTOR)
+  store.put(_entry('bb22'), VECTOR)
+  store.touch_many({(SCOPE, 'aa11'): 5, (SCOPE, 'bb22'): 2})
+  first = store.get_exact(SCOPE, 'aa11')
+  second = store.get_exact(SCOPE, 'bb22')
+  assert first is not None and second is not None
+  assert first.hits == 5
+  assert second.hits == 2
+
+
+def test_touch_many_adds_rather_than_assigns(store: Postgres) -> None:
+  store.put(_entry('aa11'), VECTOR)
+  store.touch_many({(SCOPE, 'aa11'): 3})
+  store.touch_many({(SCOPE, 'aa11'): 4})
+  entry = store.get_exact(SCOPE, 'aa11')
+  assert entry is not None
+  assert entry.hits == 7
+
+
+def test_touch_many_sets_last_used_at(store: Postgres) -> None:
+  store.put(_entry('aa11'), VECTOR)
+  entry = store.get_exact(SCOPE, 'aa11')
+  assert entry is not None
+  assert entry.last_used_at is None
+  store.touch_many({(SCOPE, 'aa11'): 1})
+  entry = store.get_exact(SCOPE, 'aa11')
+  assert entry is not None
+  assert entry.last_used_at is not None
+
+
+def test_touch_many_is_scoped(store: Postgres) -> None:
+  store.put(_entry('aa11'), VECTOR)
+  store.touch_many({('gpt-4o|thread:other', 'aa11'): 9})
+  entry = store.get_exact(SCOPE, 'aa11')
+  assert entry is not None
+  assert entry.hits == 0
+
+
+def test_touch_many_ignores_unknown_rows(store: Postgres) -> None:
+  store.put(_entry('aa11'), VECTOR)
+  store.touch_many({(SCOPE, 'aa11'): 1, (SCOPE, 'ghost'): 4})
+  entry = store.get_exact(SCOPE, 'aa11')
+  assert entry is not None
+  assert entry.hits == 1
+
+
+def test_touch_many_with_empty_mapping_is_a_noop(store: Postgres) -> None:
+  store.touch_many({})

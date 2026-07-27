@@ -1,4 +1,4 @@
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 
 import psycopg
@@ -141,6 +141,36 @@ class Postgres:
     ).format(table=self._table)
     with self._connection() as conn:
       conn.execute(query, (scope, fingerprint))
+
+  def touch_many(self, counts: Mapping[tuple[str, str], int]) -> None:
+    """Apply many hit counts in one round trip.
+
+    Takes {(scope, fingerprint): delta} so a batch of repeat hits on the same
+    entry collapses into a single `hits + n`, instead of one UPDATE each. The
+    deltas are added, not assigned, so this stays correct alongside concurrent
+    writers.
+    """
+    if not counts:
+      return
+    rows = sql.SQL(', ').join(
+      sql.SQL('({}, {}, {})').format(
+        sql.Placeholder(), sql.Placeholder(), sql.Placeholder()
+      )
+      for _ in counts
+    )
+    query = sql.SQL(
+      'UPDATE {table} AS c '
+      'SET hits = c.hits + v.delta::integer, last_used_at = now() '
+      'FROM (VALUES {rows}) AS v(scope, fingerprint, delta) '
+      'WHERE c.scope = v.scope AND c.fingerprint = v.fingerprint'
+    ).format(table=self._table, rows=rows)
+    params = [
+      value
+      for (scope, fingerprint), delta in counts.items()
+      for value in (scope, fingerprint, delta)
+    ]
+    with self._connection() as conn:
+      conn.execute(query, params)
 
   def evict_expired(self) -> int:
     query = sql.SQL(

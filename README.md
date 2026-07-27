@@ -166,6 +166,9 @@ and expiry applied as a filter on top.
 ## Layout
 
 - `src/llm_cache/cache.py` — `Cache`, the exact → semantic path and degradation
+- `src/llm_cache/buffer.py` — `TouchBuffer`, in-memory hit counting
+- `src/llm_cache/maintenance.py` — `Maintenance`, the housekeeping thread
+- `src/llm_cache/config.py` — `Settings`, environment-backed configuration
 - `src/llm_cache/keys.py` — query normalisation and fingerprint hashing
 - `src/llm_cache/models.py` — `CacheEntry`, `Embedding`
 - `src/llm_cache/embeddings.py` — `Embedder` protocol, `OpenAIEmbedder`
@@ -199,6 +202,47 @@ Migrations are hand-written SQL. There are no SQLAlchemy models, so
 `--autogenerate` has nothing to diff and is unused.
 
 ## Maintenance
+
+Housekeeping runs on one background thread, off the request path:
+
+```python
+from llm_cache.buffer import TouchBuffer
+from llm_cache.maintenance import Maintenance
+
+buffer = TouchBuffer(store)
+
+with Maintenance(store, buffer=buffer):
+    ...                                  # your application runs here
+    buffer.touch(scope, fingerprint)     # in-memory, no I/O
+```
+
+`Maintenance` flushes buffered hits every 5s and runs `evict_expired` and
+`purge` every 5 minutes. Exiting the block stops the thread and writes out any
+pending counts. All three intervals are constructor arguments, and `run_once()`
+runs every job immediately.
+
+**Why buffer the hits.** Nothing on the read path consults `hits` or
+`last_used_at`, so recording a hit should not sit between the caller and their
+response. Counting in memory also collapses repeats: 2000 hits across 50 entries
+becomes one statement rather than 2000. Measured on the docker-compose Postgres:
+
+| | request path | round trips |
+| --- | --- | --- |
+| `store.touch()` per hit | 633 ms | 2000 |
+| `buffer.touch()` per hit | 0.4 ms | 0 |
+| one background flush | — | 1 |
+
+The trade is that up to one flush interval of counts is lost if the process
+dies, and a flush that fails drops its batch rather than retrying. These are
+cache statistics; nothing reconciles against them.
+
+**Why eviction is not urgent.** `get_exact` and `search` both filter
+`expires_at`, so an expired entry is already invisible. `evict_expired` only
+reclaims space — which is exactly why it must not be called from `set()`, where
+it would make one unlucky request pay for a table-wide DELETE.
+
+The store methods remain callable directly if you'd rather schedule them
+yourself with cron or a k8s CronJob:
 
 ```python
 store.evict_expired()   # delete rows past expires_at
