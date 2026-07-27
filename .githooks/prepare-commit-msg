@@ -1,0 +1,65 @@
+#!/bin/sh
+# Drafts the commit message from the staged diff with Claude, then leaves it in
+# the editor for review. Never blocks a commit: on any failure the message is
+# left exactly as git prepared it.
+#
+# Enabled with: git config core.hooksPath .githooks
+# Skipped for one commit with: NO_AI_COMMIT_MSG=1 git commit
+# Model overridden with: AI_COMMIT_MODEL=haiku git commit
+
+msg_file="$1"
+source="$2"
+
+[ -n "$NO_AI_COMMIT_MSG" ] && exit 0
+
+# Only draft when git has no message of its own yet. -m/-F ('message'), merges,
+# squashes and amends ('commit') all arrive with text that must not be replaced.
+case "$source" in
+  message | merge | squash | commit) exit 0 ;;
+esac
+
+# GUI git clients start hooks with a minimal PATH.
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH
+command -v claude >/dev/null 2>&1 || exit 0
+
+[ -n "$(git diff --cached --name-only)" ] || exit 0
+
+# Truncated: a huge diff costs tokens and buries the summary. The stat survives
+# in full so the message still reflects the whole change.
+context=$(
+  printf 'Recent commit subjects, for style:\n'
+  git log -n 10 --format='%s' 2>/dev/null
+  printf '\nFiles changed:\n'
+  git diff --cached --stat
+  printf '\nStaged diff:\n'
+  git diff --cached | head -c 40000
+)
+
+draft=$(
+  printf '%s' "$context" | claude -p --model "${AI_COMMIT_MODEL:-sonnet}" \
+    --allowed-tools '' \
+    --append-system-prompt 'You are a commit message generator invoked from a
+git hook. Your entire output is written verbatim into a commit message file.
+Emit the message and nothing else: no greeting, no explanation of your choices,
+no offer to help further, no code fences. There is no user to talk to.' \
+    'Write the commit message for this staged diff.
+
+- First line: imperative summary, 72 characters or fewer, no trailing period.
+- Then a blank line, then a body, but only if it says something the summary
+  cannot carry on its own. Small, obvious changes are better off with no body.
+- The body explains why the change was made and what a reviewer would
+  otherwise have to reconstruct: behaviour changes that are not visible in the
+  diff, constraints that forced the approach, work deliberately left out.
+- Never restate the diff, never list files, never pad with filler.
+- Wrap the body at 72 characters. Plain text; hyphens for any bullets.
+- Match the style of the recent subjects unless it hurts clarity.
+
+Output the message only: no preamble, no explanation, no code fences.' 2>/dev/null
+) || exit 0
+
+[ -n "$draft" ] || exit 0
+
+# Keep git's own comment block below the draft, so --verbose diffs and the
+# "Please enter the commit message" help stay intact.
+printf '%s\n\n%s\n' "$draft" "$(cat "$msg_file")" >"$msg_file"
