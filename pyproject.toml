@@ -48,4 +48,5 @@ quote-style = "single"
 pythonpath = ["src"]
 markers = [
     "integration: needs a live Postgres with pgvector (see docker-compose.yml)",
+    "unit: pure logic, no database or network",
 ]

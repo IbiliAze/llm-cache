@@ -41,13 +41,9 @@ def db(migrated_dsn: str) -> Iterator[psycopg.Connection]:
     yield conn
 
 
-@pytest.fixture(autouse=True)
-def clean_table(db: psycopg.Connection) -> None:
-  db.execute('TRUNCATE llm_cache')
-
-
 @pytest.fixture
-def store(migrated_dsn: str) -> Iterator[Postgres]:
+def store(migrated_dsn: str, db: psycopg.Connection) -> Iterator[Postgres]:
+  db.execute('TRUNCATE llm_cache')
   store = Postgres(migrated_dsn)
   yield store
   store.close()

@@ -1,9 +1,14 @@
+from collections.abc import Generator
+from contextlib import contextmanager
+
+import psycopg
 from pgvector.psycopg import register_vector
 from psycopg import sql
 from psycopg.rows import class_row, dict_row
 from psycopg.types.json import Jsonb
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
+from llm_cache.exceptions import StoreError
 from llm_cache.models import CacheEntry, Embedding
 
 _ENTRY_COLUMN_NAMES = (
@@ -52,13 +57,27 @@ class Postgres:
     self._table = sql.Identifier(table)
     self._pool = ConnectionPool(dsn, open=True, configure=register_vector)
 
+  @contextmanager
+  def _connection(self) -> Generator[psycopg.Connection, None, None]:
+    """Borrow a pooled connection, reporting infrastructure faults as StoreError.
+
+    Only the "database is unreachable" family is translated. Programming errors
+    — a missing table, mismatched vector dimensions — stay as psycopg errors so
+    they surface as bugs instead of being downgraded to a cache miss.
+    """
+    try:
+      with self._pool.connection() as conn:
+        yield conn
+    except (psycopg.OperationalError, PoolTimeout) as exc:
+      raise StoreError('cache store unavailable') from exc
+
   def get_exact(self, scope: str, fingerprint: str) -> CacheEntry | None:
     query = sql.SQL(
       'SELECT {columns} FROM {table} '
       'WHERE scope = %s AND fingerprint = %s '
       'AND (expires_at IS NULL OR expires_at > now())'
     ).format(columns=_COLUMNS, table=self._table)
-    with self._pool.connection() as conn:
+    with self._connection() as conn:
       with conn.cursor(row_factory=class_row(CacheEntry)) as cur:
         cur.execute(query, (scope, fingerprint))
         return cur.fetchone()
@@ -79,7 +98,7 @@ class Postgres:
       'LIMIT %s'
     ).format(columns=_COLUMNS, table=self._table)
     vector = list(embedding)
-    with self._pool.connection() as conn:
+    with self._connection() as conn:
       with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(query, (vector, scope, vector, limit))
         return [
@@ -98,7 +117,7 @@ class Postgres:
       placeholders=_PLACEHOLDERS,
       assignments=_UPSERT_ASSIGNMENTS,
     )
-    with self._pool.connection() as conn:
+    with self._connection() as conn:
       conn.execute(
         query,
         (
@@ -120,7 +139,7 @@ class Postgres:
       'UPDATE {table} SET hits = hits + 1, last_used_at = now() '
       'WHERE scope = %s AND fingerprint = %s'
     ).format(table=self._table)
-    with self._pool.connection() as conn:
+    with self._connection() as conn:
       conn.execute(query, (scope, fingerprint))
 
   def evict_expired(self) -> int:
@@ -131,7 +150,7 @@ class Postgres:
       """
     ).format(table=self._table)
 
-    with self._pool.connection() as conn:
+    with self._connection() as conn:
       cursor = conn.execute(query)
       return cursor.rowcount
 
@@ -148,13 +167,13 @@ class Postgres:
       """
     ).format(table=self._table)
 
-    with self._pool.connection() as conn:
+    with self._connection() as conn:
       cursor = conn.execute(query, (self.max_entries,))
       return cursor.rowcount
 
   def clear(self, scope: str) -> int:
     query = sql.SQL('DELETE from {table} WHERE scope = %s').format(table=self._table)
-    with self._pool.connection() as conn:
+    with self._connection() as conn:
       cursor = conn.execute(query, (scope,))
       return cursor.rowcount
 
