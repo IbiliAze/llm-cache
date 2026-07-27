@@ -18,6 +18,9 @@ dependencies = [
 langchain = [
     "langchain-core>=1.4.9",
 ]
+openai = [
+    "openai>=2.45.0",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -1,10 +1,10 @@
 from pgvector.psycopg import register_vector
 from psycopg import sql
-from psycopg.rows import class_row
+from psycopg.rows import class_row, dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from ..models import CacheEntry, Embedding
+from llm_cache.models import CacheEntry, Embedding
 
 _ENTRY_COLUMN_NAMES = (
   'scope',
@@ -66,7 +66,26 @@ class Postgres:
   def search(
     self, scope: str, embedding: Embedding, limit: int
   ) -> list[tuple[CacheEntry, float]]:
-    """"""
+    """Nearest neighbours in `scope`, best first, as (entry, similarity).
+
+    Returns the top `limit` regardless of how far away they are — deciding what
+    counts as close enough is the caller's threshold to apply, not the store's.
+    """
+    query = sql.SQL(
+      'SELECT {columns}, 1 - (embedding <=> %s::vector) AS similarity '
+      'FROM {table} '
+      'WHERE scope = %s AND (expires_at IS NULL OR expires_at > now()) '
+      'ORDER BY embedding <=> %s::vector '
+      'LIMIT %s'
+    ).format(columns=_COLUMNS, table=self._table)
+    vector = list(embedding)
+    with self._pool.connection() as conn:
+      with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, (vector, scope, vector, limit))
+        return [
+          (CacheEntry(**{k: row[k] for k in _ENTRY_COLUMN_NAMES}), row['similarity'])
+          for row in cur.fetchall()
+        ]
 
   def put(self, entry: CacheEntry, embedding: Embedding) -> None:
     query = sql.SQL(

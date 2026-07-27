@@ -419,6 +419,9 @@ dependencies = [
 langchain = [
     { name = "langchain-core" },
 ]
+openai = [
+    { name = "openai" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -432,12 +435,13 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.18.5" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.4.9" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=2.45.0" },
     { name = "pgvector", specifier = ">=0.5.0" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.4" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
 ]
-provides-extras = ["langchain"]
+provides-extras = ["langchain", "openai"]
 
 [package.metadata.requires-dev]
 dev = [

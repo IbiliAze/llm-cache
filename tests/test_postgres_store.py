@@ -1,3 +1,7 @@
+import math
+import random
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from llm_cache.models import CacheEntry
@@ -126,3 +130,68 @@ def test_touch_is_scoped(store: Postgres) -> None:
 
 def test_touch_on_missing_row_is_a_noop(store: Postgres) -> None:
   store.touch(SCOPE, 'nope')
+
+
+def _unit(values: list[float]) -> list[float]:
+  norm = math.sqrt(sum(v * v for v in values))
+  return [v / norm for v in values]
+
+
+@pytest.fixture
+def vectors() -> tuple[list[float], list[float], list[float]]:
+  """A base vector, one almost identical to it, and one unrelated."""
+  rng = random.Random(0)
+  base = _unit([rng.random() for _ in range(1536)])
+  near = _unit([v + rng.gauss(0, 0.005) for v in base])
+  far = _unit([rng.random() for _ in range(1536)])
+  return base, near, far
+
+
+def test_search_orders_by_similarity(store: Postgres, vectors) -> None:
+  base, near, far = vectors
+  store.put(_entry('identical'), base)
+  store.put(_entry('similar'), near)
+  store.put(_entry('unrelated'), far)
+  results = store.search(SCOPE, base, 5)
+  assert [e.fingerprint for e, _ in results] == ['identical', 'similar', 'unrelated']
+  assert results[0][1] == pytest.approx(1.0, abs=1e-6)
+  assert results[0][1] > results[1][1] > results[2][1]
+
+
+def test_search_respects_limit(store: Postgres, vectors) -> None:
+  base, near, far = vectors
+  store.put(_entry('identical'), base)
+  store.put(_entry('similar'), near)
+  store.put(_entry('unrelated'), far)
+  assert len(store.search(SCOPE, base, 1)) == 1
+
+
+def test_search_is_scoped(store: Postgres, vectors) -> None:
+  base, _, _ = vectors
+  other = _entry('elsewhere')
+  other.scope = 'gpt-4o|thread:other'
+  store.put(other, base)
+  assert store.search(SCOPE, base, 5) == []
+
+
+def test_search_skips_expired(store: Postgres, vectors) -> None:
+  base, near, _ = vectors
+  stale = _entry('stale')
+  stale.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+  store.put(stale, base)
+  store.put(_entry('live'), near)
+  assert [e.fingerprint for e, _ in store.search(SCOPE, base, 5)] == ['live']
+
+
+def test_search_returns_full_entries(store: Postgres, vectors) -> None:
+  base, _, _ = vectors
+  store.put(_entry('aa11'), base)
+  entry, score = store.search(SCOPE, base, 1)[0]
+  assert entry.response == '4'
+  assert entry.metadata == {'tokens': 7}
+  assert isinstance(score, float)
+
+
+def test_search_on_empty_scope_returns_empty_list(store: Postgres, vectors) -> None:
+  base, _, _ = vectors
+  assert store.search(SCOPE, base, 5) == []
