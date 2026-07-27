@@ -5,6 +5,8 @@ description = "Semantic cache for LLM responses, backed by Postgres and pgvector
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.18.5",
+    "pgvector>=0.5.0",
     "psycopg[binary,pool]>=3.3.4",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.2",
